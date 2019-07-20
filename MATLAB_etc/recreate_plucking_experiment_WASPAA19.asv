@@ -1,0 +1,288 @@
+%%
+% This script will recreate the experiment that estimates guitar string,
+% fret and plucking position on a recording with sudden changes of all these positions.
+% The script serves the purpose of clearifying the implementation of the
+% the proposed method entitled 
+% "Physical Models for Fast Estimation of Guitar String, Fret and Plucking Position"
+% published at IEEE WASPAA 2019.
+%
+% It should help the reader understand how to implement the method and
+% explain details not mentioned in the theory in the paper.
+%
+% Along with the script follows a single audio recording of electric
+% guitar, which was used for testing in the paper. The "SNR" tests uses the
+% database from the IEEE ICASSP 2019 publication entitled 
+% "Estimation of Guitar String, Fret and Plucking Position" by Hjerrild et.
+% al.
+%
+% If you find this code useful in your research, please cite the paper:
+%
+% ------------------------------------------------------------------------
+% LaTeX citation format:
+%
+% @INPROCEEDINGS{Hjer1910:Physical,
+% AUTHOR="Jacob M. Hjerrild and Silvin Willemsen and Mads G. Christensen",
+% TITLE="Physical Models for Fast Estimation of Guitar String, Fret and Plucking
+% Position",
+% BOOKTITLE="2019 IEEE Workshop on Applications of Signal Processing to Audio and
+% Acoustics (WASPAA) (WASPAA 2019)",
+% ADDRESS="New Paltz, USA",
+% DAYS=20,
+% MONTH=oct,
+% YEAR=2019 }
+%
+% ------------------------------------------------------------------------
+% Implemented by Jacob M. Hjerrild at TC Electronic and Audio Analysis Lab, Aalborg University
+% Feb-April 2019.
+%%
+clear all;
+addpath(genpath('util'));
+mirverbose(0);
+
+%% Simulation of the feature space
+
+for iiii=1:500 % iiii realizations of each class 
+%% Pluck position and displacement
+P = 1 / 3; 	% plucking position (does n?t influence w0 and B)
+force = .05; % plucking force.
+
+L0 = 0.6411 + [1 2 9 4 5 2]'* 1e-3; % distance from nut to bridge
+
+numStrings = 6;
+strNdx = (1:numStrings)';
+numFrets = 12;
+fretNdx = (0:numFrets)';
+    
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% String Material properties
+Esteel = 2.27e11; % Young's modulus for steel
+G = 79.3e9; % known shear modulus for steel
+rhoCore = 7950; % steel density [kg/m^3]
+rhoWrapping = 6000; % nickel-type density[kg/m^3]
+dFull = [.010; .013; .0172; .026; .036; .046] * 0.0254; %full diameter for the  strings
+dCore = [.010; .013; .0172; .0146; .016; .018] * 0.0254; %core diameter without wrapping
+T0 = [16.5; 16; 17.5; 18.5; 20; 17;]*4.45;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Add normally distributed noise to string material properties
+percentageStd = 0.005; % we use this as a factor to the standard deviation.
+L0 = L0.*2.^(-fretNdx'/12); % length for each fret
+% Add noise to L0
+L0=L0+percentageStd*randn(size(L0)).*L0;
+% Add noise to T0
+T0=T0+percentageStd*randn(size(T0)).*T0;
+% Add noise to dCore
+dCore=dCore+percentageStd*randn(size(dCore)).*dCore;
+% Add noise to dWrapping
+dWrapping = (dFull - dCore) / 2; %diameter of wrapping wire
+dWrapping=dWrapping+percentageStd*randn(size(dWrapping)).*dWrapping;
+
+% Add noise to plucking force
+force=force+percentageStd*randn(size(force)).*force;
+
+%Crosssection core [m^2]
+ACore = (pi*(dCore/2).^2);
+
+% Mass-per-unit length
+mu = ACore .* rhoCore + rhoWrapping * ((2 * dWrapping + dCore).^2 - dCore.^2) * (pi / 4);
+
+% Calculating deltaL from noisy material properties
+D = dCore + dWrapping;
+TcOverTw = (8 * ACore .* D.^3 .* Esteel) ./ (G * dWrapping.^5);
+Tc = T0 ./ ((1 ./ TcOverTw) + 1);
+Tw = T0 ./ (TcOverTw + 1);
+deltaL = (L0 .* Tc) ./ (ACore * Esteel + Tc);
+% calculate effective Young's modulus for all strings
+E = (Tc ./ ACore) ./ (deltaL ./ (L0 - deltaL));
+Eeff = (T0 ./ ACore) ./ (deltaL ./ (L0 - deltaL));
+% Transverse Displacement [Abbot, Strings in the 16th and 17th Centuries, 1974, Appendix 3]
+deltaP = ((L0 * P .* force .* (1-P)) ./ T0).^2; 
+% Length extension
+deltaDeltaL = sqrt((P .* L0).^2 + deltaP.^2) + sqrt(((1 - P).*L0).^2 + deltaP.^2) - L0;
+% Displacement as if plucked in the middle (retaining the length extension)
+deltaHalf = sqrt((deltaDeltaL.^2 + deltaDeltaL .* L0 * 2) / 4);
+
+%% Calculate inharmonicity factor
+K = (pi^3 * Eeff .* dCore.^2) ./ (16 * T0 .* L0.^2);
+
+% B is a sum of intrinsic and pluck deflection
+BIntrinsic(:,:,iiii) = (K ./ 4) .* dCore.^2;
+BPluck(:,:,iiii) = ((K * 3) ./ 8) .* deltaHalf.^2;
+
+% fundamental frequency
+f0(:,:,iiii) = sqrt(T0./mu)./L0/2;
+
+end
+BMixed = BIntrinsic + BPluck;
+BSimulations = BMixed;
+pitchSimulations = f0;
+w0Model = f0;
+
+% train the classifier
+K = size(w0Model,1)*size(w0Model,2); % number of classes    
+kk=0;
+featureMatrix=[];
+model=[];
+for strings=6:-1:1
+    for frets=1:13
+    kk=kk+1;
+    featureMatrix(:,:,kk) = [squeeze(w0Model(strings,frets,:)) squeeze(BMixed(strings,frets,:))];
+    model.mu(:,kk) = mean(featureMatrix(:,:,kk)); % mean of class k
+    model.Sigma(:,:,kk) = cov(featureMatrix(:,:,kk)); % covariance of class k
+    model.w(kk)=1/K; % prior is uniform
+    end
+end
+% the model will contain the parameters of interest, which is:
+% mu: the expected value of each class.with dimension: 2 by K
+% sigma: the covariance of simulated classes in the feature space.
+% we note that the prior w is uniform.
+%
+%% Initialize estimator/classifier implementation constants 
+segmentDuration = 40e-3; % segment duration in seconds.
+LOpen = 64.3; % assumed length of all open strings.
+M = 25; % assumed high number of harmonics (M>>1). Used for inharmonic pitch estimation and for estimation of plucking position on the fretted string.
+MInitial = 5; % number of harmonics for initial harmonic estimate (B=0).
+f0Limits = [75 700]; % boundaries for f0 search grid in Hz.
+nFFT = 2^19; % Length of  zero-padded FFT.
+betaRes = 1e-5; % resolution of search grid for B.
+BSearchGrid = [min(model.mu(2,:)):betaRes:max(model.mu(2,:))];
+
+%% read in the observed guitar recording and do onset detection
+[recordedSignal,fs]=audioread('recording_of_plucking_with_sudden_changes.wav');
+% segment the signal from every onset event (i.e. 40 ms)
+[segments, onsetsInSeconds] = icassp19_segment_from_all_onsets(recordedSignal,fs,segmentDuration); 
+
+%% Estimate string, fret and plucking position on every 40 ms. segment
+for segmentNdx = 1:size(segments,2)
+    % Hilbert transform and windowing
+    x = icassp19_apply_gaussian_window(segments(:,segmentNdx));
+    x = icassp19_hilbert_transform(x,fs); 
+
+    %% Feature extraction with the inharmonic pitch estimator
+    % The implementation of the pitch estimator is done with one FFT, since it is fast
+    % Hence, it is equivalent to harmonic summation which the in the proposed 
+    % method is extended to inharmonic summation.
+    [~,X, ~] = icassp19_fft(x, fs, nFFT);
+    f0Initial = icassp19_harmonic_summation(X, f0Limits, MInitial, fs);
+    w0Model = reshape(model.mu(1,:),13,6)';
+    [sC, fC] = icassp19_obtain_pitch_candidates(f0Initial,w0Model);
+    ndx = (sC*13)-12+fC;
+    
+    % fast implementation of inharmonic pitch estimation based on the
+    % models range of B for each candidate class
+    cntPitch = 0;
+    for ndxPitch = ndx
+        cntPitch = cntPitch+1;
+        % inharmonic pitch estimation
+        BSearchGrid = [min(featureMatrix(:,2,ndxPitch)):betaRes:max(featureMatrix(:,2,ndxPitch))];
+        [pitchEstimate(cntPitch), BEstimate(cntPitch),costMaxVal(cntPitch)] = icassp19_inharmonic_summation(X, f0Initial, M, fs, BSearchGrid,nFFT); 
+    end
+    [~,I] = max(costMaxVal); 
+    pitchEstimatePhi(segmentNdx) = pitchEstimate(I);
+    BEstimatePhi(segmentNdx) = BEstimate(I);
+    clear pitchEstimate BEstimate  I costMaxVal;
+    
+    % feature vector computed from the observation x
+    phi = [pitchEstimatePhi(segmentNdx); BEstimatePhi(segmentNdx)];
+    
+    %% Test the classifier
+    cntCandidates=0;
+    for ndx = (sC*13)-12+fC
+        cntCandidates=cntCandidates+1;
+        mu = model.mu(:,ndx);
+        Gamma = model.Sigma(:,:,ndx);
+        P = model.w(ndx);
+    
+        %% Classifier
+        [J(cntCandidates)] = max(-log(det(Gamma)) + 2*log(P) ...
+                           - mu'*inv(Gamma)*mu + 2*phi'*inv(Gamma)*mu - phi'*inv(Gamma)*phi);
+%                           
+    end
+    [~,I] = max(J); 
+    clear J euclideanDistance;
+
+    stringEstimate(segmentNdx) = sC(I);
+    fretEstimate(segmentNdx) = fC(I);
+
+    %% Estimate the amplitudes (alpha vector)
+    Z = icassp19_Z(pitchEstimatePhi(segmentNdx),length(x),fs,M,BEstimatePhi(segmentNdx));
+    alpha = inv(Z'*Z)*Z'*x;
+    amplitudesAbs = abs(alpha)'; % absolute values for the estimator
+
+    %% Plucking Position Estimator (minimizer of log spectral distance)
+    L = LOpen * 2^(-fretEstimate(segmentNdx)/12); % length of vibrating part of the estimated string
+    pluckCmFromBridge(segmentNdx) = icasssp19_plucking_position_estimator_LSD(amplitudesAbs,L);
+    %[pluckCmFromBridge(segmentNdx)] = smc_minimize_ideal_amplitudes_training_in_middle(amplitudesAbs,L)
+    fprintf('\n Estimating string, fret and plucking position for segment %1.0f out of %1.0f segments',segmentNdx,size(segments,2));
+end
+
+%% Plot the results and compare audio playback
+recordDuration = length(recordedSignal)/fs;
+timeAxis = [0:1/fs:recordDuration-1/fs];
+
+figure(2); clf
+subplot(3,1,1)
+% plot the recorded signal in time domain
+plot(timeAxis,recordedSignal); ylabel('Ampl.'); 
+grid minor;
+set(gca,'xticklabel',[]);
+subplot(3,1,2)
+% plot the plucking poition estimates as distance from the bridge.
+plot(onsetsInSeconds(1:segmentNdx),pluckCmFromBridge(1:segmentNdx),'x');
+ylim([4 32])
+set(gca,'xticklabel',[]); ylabel('$\hat{P}$[cm]','interpreter','latex')
+grid minor;
+subplot(3,1,3)
+for p=1:6
+    % plot the backrground lines that represents guitar strings
+    plot([0,recordDuration],[p,p], 'Color', [0.4 0.4 0.4], 'linewidth',1); hold on;
+end
+ylim([0.1 6.9]);
+for nn = 1:segmentNdx
+    % plot the estimated string and fret positions
+    text(onsetsInSeconds(nn)-0.2,stringEstimate(nn),sprintf('%1.0f',fretEstimate(nn)),'fontsize', 18)
+end
+set(gca,'ytick',[1 2 3 4 5 6])
+yticklabels({'1','2','3','4','5','6'})
+ylabel('String Est.'); xlabel('Time [sec]');
+
+
+
+% %% plot with zoom as done in the paper.
+% w0=f0(:);
+% BMixed = BMixed(:);
+% minX = 192; maxX = 204;
+% minY = .88e-4; maxY = 1.4e-4;
+% figure(20); clf
+% 
+% scatter1 = scatter(w0,BMixed,10,'filled','o','MarkerFaceColor',0*[0.43 0.43 0.43],'MarkerEdgeColor',0*[0.21 0.21 0.21]); 
+% hold on;
+% 
+% plot([minX minX],[minY maxY],'k',[maxX maxX],[minY maxY],'k')
+% plot([minX maxX],[minY minY],'k',[minX maxX],[maxY maxY],'k')
+% plot([minX 200],[minY 2.98e-4],'--k')
+% plot([maxX 470],[minY 2.98e-4],'--k')
+% plot([minX 200],[maxY 4.3e-4],'--k')
+% plot([maxX 470],[maxY 4.3e-4],'--k')
+% l=legend('Simulated','Measured');
+% set(l,'Position',[.63 .8470 0.1 0.2],'orientation', 'horizontal'); legend boxoff 
+% 
+% grid minor
+% ylabel('B [\cdot]'); xlabel('\omega_0 [Hz]');
+% xlim([80 500]); ylim([1e-5 5e-4]);
+% % zoom in
+% axes('position',[.35 .6 .5 .25])
+% 
+% oneClassf0 = w0((w0>minX) & (w0<maxX) & BMixed>minY & BMixed<maxY);
+% oneClassB = BMixed(w0>minX & (w0<maxX) & BMixed>minY & BMixed<maxY);
+% 
+% axis tight; box on;
+% hold on; scatter(oneClassf0(:),oneClassB(:),'o','MarkerFaceColor',0*[0.43 0.43 0.43],'MarkerEdgeColor',0*[0.21 0.21 0.21]);%'MarkerFaceColor',1.1*[.9 .69 .0 ],'MarkerEdgeColor',[0.91 0.61 0.01]);
+% 
+% 
+% title('Featurespace of the electric guitar.')
+
+%% listen to the recorded signal and take a look at the plot :)
+soundsc(recordedSignal,fs);
+%%
+measurements_and_simulation_of_martin_acoustic_guitar;
+measurement_and_simulation_of_firebrand_electric_guitar

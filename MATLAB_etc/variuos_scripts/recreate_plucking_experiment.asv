@@ -1,0 +1,174 @@
+%%
+% This script will recreate the experiment that estimates guitar string,
+% fret and plucking position on a recording with sudden changes of all these positions.
+% The script serves the purpose of clearifying the implementation of the
+% the proposed method entitled 
+% "Physical Models for Fast Estimation of Guitar String, Fret and Plucking Position"
+% published at IEEE WASPAA 2019.
+%
+% It should help the reader understand how to implement the method and
+% explain details not mentioned in the theory in the paper.
+%
+% The script follows a dataset containing recording of electric
+% and acoustic guitar, which was used for training and testing in the paper.
+%
+% If you find this code or data set useful, please cite the paper:
+%
+% ------------------------------------------------------------------------
+% LaTeX citation format:
+%
+% @INPROCEEDINGS{Hjer1910:Physical,
+% AUTHOR="Jacob Hjerrild and Silvin Willemsen and Mads Gr?sb?ll Christensen",
+% TITLE="Physical Models for Fast Estimation of Guitar String, Fret and Plucking
+% Position",
+% BOOKTITLE="2019 IEEE Workshop on Applications of Signal Processing to Audio and
+% Acoustics (WASPAA) (WASPAA 2019)",
+% ADDRESS="New Paltz, USA",
+% DAYS=20,
+% MONTH=oct,
+% YEAR=2019,
+% ABSTRACT="In this paper, a method for analyzing guitar performances is proposed;
+% specifically, a fast and effective method for extracting the activated
+% string, fret and plucking position from guitar recordings. The method is
+% derived from guitar-string physics and unlike state-of-the-art methods it
+% does not require training data in the form of audio, since it relies on
+% known string properties. We propose a simulated model of the feature
+% vectors, which is class dependent and fast to compute. A maximum a
+% posteriori classifier is proposed for classification of string and fret.
+% The method extracts features from audio with a maximum likelihood
+% parametric pitch estimator that includes inharmonicity of the string. The
+% string and fret classifier is evaluated on recordings of electric and
+% acoustic guitar under various noisy conditions: the absolute error of
+% string and fret classification is comparable to the state-of-the-art, and
+% performance is shown to break down at an SNR below 20 dB. The plucking
+% position estimator is the minimizer of the log spectral distance between
+% the amplitudes of the observed signal and the plucking model and it is
+% evaluated in a proof-of-concept experiment with sudden changes of string,
+% fret and plucking positions, which can be estimated accurately. Since the
+% estimator operates on a 40 ms segment-by-segment basis it is suitable for
+% high tempo and real-time applications."
+% }
+% ------------------------------------------------------------------------
+% Implemented by Jacob M??ller at the Audio Analysis Lab, Aalborg University
+%  October 2018.
+%%
+clear all;
+addpath(genpath('util'));
+mirverbose(0);
+addpath mats
+
+%% Load trained model (training data was captured from the given fret)
+trainingFret = 4; % user can set the fret from which the audio is captured for training a model of the guitar strings.
+modelFile = sprintf('trained_model_of_firebird_from_%1.0fth_fret',trainingFret);
+load(modelFile);
+% the model will contain the parameters of interest, which is:
+% mu: the expected value of each class.(normalized and with dimension: K by
+% 2), see i.e. eq. (19) and eq. (20)
+% normalizationConstant: these are the values that has been used for
+% normalizing mu. These two constants is the maximum value of the mean of
+% the observations of omega0 and B.
+% sigma: the mean of all variances in the normalized feature space.
+% we note that the prior is uniform and is not included here.
+%
+% all other parameters in the loaded model file can potentially be of
+% interest, but is not required for the proposed classifier.
+
+%% Initialize implementation constants 
+segmentDuration = 40e-3; % segment duration in seconds.
+LOpen = 64.3; % assumed length of all open strings.
+M = 25; % assumed high number of harmonics (M>>1). Used for inharmonic pitch estimation and for estimation of plucking position on the fretted string.
+MInitial = 5; % number of harmonics for initial harmonic estimate (B=0).
+f0Limits = [75 700]; % boundaries for f0 search grid in Hz.
+nFFT = 2^19; % Length of  zero-padded FFT.
+BRes = 1e-7; % resolution of search grid for B in m^(-2)
+plausibilityFilterFlag = 0; % The user can apply a plausibility filter by setting this flag to 1.
+
+%% read in the observed guitar recording and do onset detection
+[recordedSignal,fs]=audioread('util/recording_of_plucking_with_sudden_changes.wav');
+% segment the signal from every onset event (i.e. 40 ms)
+[segments, onsetsInSeconds] = icassp19_segment_from_all_onsets(recordedSignal,fs,segmentDuration); 
+
+%% Estimate string, fret and plucking position on every 40 ms. segment
+for n = 1:size(segments,2)
+    % Hilbert transform and windowing
+    x = icassp19_hilbert_transform(segments(:,n),fs); 
+    x = icassp19_apply_gaussian_window(x);
+
+    %% Feature extraction with the inharmonic pitch estimator
+    % The implementation of Eq. (17) is done with one FFT, since it is fast
+    % Hence, it is equivalent to harmonic summation which the in the proposed 
+    % method is extended to inharmonic summation.
+    % See details on harmonic summation in Christensen and Jakobsson [27].
+    [~,X, ~] = icassp19_fft(x, fs, nFFT);
+    f0Initial = icassp19_harmonic_summation(X, f0Limits, MInitial, fs);
+    [pitchEstimatePhi, BEstimatePhi] = icassp19_inharmonic_summation(X, f0Initial, M, fs, BSearchGrid,nFFT);
+    
+    % feature vector computed from the observation and normalized for
+    % euclidean distance. We use the trained model as part of normalization.
+    phi = [pitchEstimatePhi BEstimatePhi]./normalizationConstant;
+    % normalizationConstant: these are the values that has been used for normalizing mu.
+
+
+    %% Classifation of String and Fret (maximum likelihood w. uniform prior)
+    % the log is taken on frequencies to linearize the frequency wise distance between
+    % consequtive notes.
+    if plausibilityFilterFlag ~= 1,
+        % this is the classifier
+        euclideanDistance   =  sqrt( (log(phi(:,1))-log(mu(:,1))).^2 + (phi(:,2)-mu(:,2)).^2 );
+        [C,I] = min(euclideanDistance);
+        fretEstimate(n) = mod(I,13)-1; % <-- due to a matrix structure (13x6)
+        stringEstimate(n) = floor((I+13)/13);
+        if fretEstimate(n) == -1, fretEstimate(n)=fretOptions(end-1); stringEstimate(n)=stringEstimate(n)-1;end
+    
+    else
+        % this is the classifier with plausability filter (see Abesser et al. [7])
+        [sC, fC] = icassp19_obtain_pitch_candidates(pitchEstimatePhi,pitchModelOriginalUnits(:,:,trainingFret)');
+        ndx = (sC*13)-12+fC;
+        euclideanDistance   =  sqrt( (log(phi(:,1))-log(mu([ndx],1))).^2 + (phi(:,2)-mu([ndx],2)).^2 );
+        [C,I] = min(euclideanDistance);
+        stringEstimate(n) = sC(I);
+        fretEstimate(n) = fC(I);
+    end
+    %% Estimate the amplitudes (alpha vector)
+    Z = icassp19_Z(pitchEstimatePhi,length(x),fs,M,BEstimatePhi);
+    alpha = inv(Z'*Z)*Z'*x;
+    amplitudesAbs = abs(alpha)'; % absolute values for the estimator
+
+    %% Plucking Position Estimator (minimizer of log spectral distance)
+    L = LOpen * 2^(-fretEstimate(n)/12); % length of vibrating part of the estimated string
+    pluckCmFromBridge(n) = icasssp19_plucking_position_estimator_LSD(amplitudesAbs,L);
+    fprintf('\n Estimating string, fret and plucking position for segment %1.0f out of %1.0f segments',n,size(segments,2));
+end
+
+%% Plot the results and compare audio playback
+recordDuration = length(recordedSignal)/fs;
+timeAxis = [0:1/fs:recordDuration-1/fs];
+
+figure(10); clf
+subplot(3,1,1)
+% plot the recorded signal in time domain
+plot(timeAxis,recordedSignal); ylabel('Ampl.'); 
+grid minor;
+set(gca,'xticklabel',[]);
+subplot(3,1,2)
+% plot the plucking poition estimates as distance from the bridge.
+plot(onsetsInSeconds(1:n),pluckCmFromBridge(1:n),'x');
+ylim([4 32])
+set(gca,'xticklabel',[]); ylabel('$\hat{P}$[cm]','interpreter','latex')
+grid minor;
+subplot(3,1,3)
+for p=1:6
+    % plot the backrground lines that represents guitar strings
+    plot([0,recordDuration],[p,p], 'Color', [0.4 0.4 0.4], 'linewidth',1); hold on;
+end
+ylim([0.1 6.9]);
+for nn = 1:n
+    % plot the estimated string and fret positions
+    text(onsetsInSeconds(nn)-0.2,stringEstimate(nn),sprintf('%1.0f',fretEstimate(nn)),'fontsize', 18)
+end
+set(gca,'ytick',[1 2 3 4 5 6])
+yticklabels({'1','2','3','4','5','6'})
+ylabel('String Est.'); xlabel('Time [sec]');
+
+% listen to the recorded signal and take a look at the plot :)
+soundsc(recordedSignal,fs);
