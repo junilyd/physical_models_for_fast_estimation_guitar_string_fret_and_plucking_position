@@ -11,7 +11,7 @@ The plucking experiment can be reproduced by running the file called "recreate_p
 Please cite this if you find it useful in your research.
 
 @INPROCEEDINGS{Hjer1910:Physical,
-AUTHOR="Jacob Møller Hjerrild and Silvin Willemsen and Mads Græsbøll Christensen",
+AUTHOR="Hjerrild {Jacob M\o ller}  and Willemsen, {Silvin} and Christensen, {Mads Gr\ae sb\o ll}",
 TITLE="Physical Models for Fast Estimation of Guitar String, Fret and Plucking
 Position",
 BOOKTITLE="2019 IEEE Workshop on Applications of Signal Processing to Audio and
